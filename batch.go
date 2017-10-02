@@ -1,47 +1,58 @@
+// SQL Batch Insert Library which can return insert ids
+//
+// Author: http://richard.warburton.it/
+//
+// Copyright: 2017 Skagerrak Software - http://www.skagerraksoftware.com/ - See LICENSE file
+//
+// Returning correct Insert IDs relies on the following behaviours:
+//
+// 1. "If you insert multiple rows using a single INSERT statement,
+// LAST_INSERT_ID() returns the value generated for the first inserted row
+// only." - https://dev.mysql.com/doc/refman/5.6/en/information-functions.html#function_last-insert-id
+//
+// 2. "If the only statements executing are 'simple inserts' where the number
+// of rows to be inserted is known ahead of time, there are no gaps in the
+// numbers generated for a single statement, except for “mixed-mode inserts”
+// - https://dev.mysql.com/doc/refman/5.7/en/innodb-auto-increment-handling.html
+//
+// So it should work reliably for MySQL's InnoDB engine, YMMV for others.
 package sqlbatchinsert
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
-
-	"context"
-
-	"google.golang.org/appengine/log"
 )
 
-const (
-	DefaultQueryMaxLength = 1 << 20 // 1MiB
-)
+const DefaultStmtMaxLength = 1 << 20 // 1MiB
 
-var (
-	ErrInsertLargerThanMaxLength = errors.New("Single Insert larger than max length permitted.")
-)
+var ErrInsertLargerThanMaxLength = errors.New("Single Insert larger than max length permitted.")
 
 type Config struct {
-	QueryMaxLength int
-	Tx             *sql.Tx
-	RecordIds      bool // Whether insert ids need to be returned
+	StmtMaxLength int // Uses DefaultStmtMaxLength if unset.
+	Tx            *sql.Tx
+	ReturnIds     bool // Whether insert ids need to be returned
 }
 
 // NewBatchInsert
-func (c *Config) NewBatchInsert(table string, fields []string) *Batch {
-	qStart := "INSERT INTO `" + table + "` (`" + strings.Join(fields, "`,`") + "`) VALUES"
-	qLength := c.QueryMaxLength
+func (c *Config) NewBatchInsert(table string, colNames []string) *BatchInsert {
+	qStart := "INSERT INTO `" + table + "` (`" + strings.Join(colNames, "`,`") + "`) VALUES "
+	qLength := c.StmtMaxLength
 	if qLength == 0 {
-		qLength = DefaultQueryMaxLength
+		qLength = DefaultStmtMaxLength
 	}
 	b := make([]byte, 0, qLength)
 	b = b[:len(qStart)]
 	copy(b, qStart)
 	var ids []int64
-	if c.RecordIds {
+	if c.ReturnIds {
 		ids = make([]int64, 0)
 	}
-	return &Batch{
+	return &BatchInsert{
 		qStartLen: len(qStart),
 		tx:        c.Tx,
 		query:     b,
@@ -49,20 +60,27 @@ func (c *Config) NewBatchInsert(table string, fields []string) *Batch {
 	}
 }
 
-type Batch struct {
+type BatchInsert struct {
 	qStartLen int
 	tx        *sql.Tx
 	query     []byte
 	ids       []int64
 }
 
-type SQLField string // Unescaped field - aggregate
+type SQLField string // Unescaped field - for values that have already been escaped
 
-func (b *Batch) Add(ctx context.Context, a ...interface{}) error {
+// Insert buffers the record and if the record + buffer > StmtMaxSize
+// pushes the buffer to the SQL server,
+func (b *BatchInsert) Insert(ctx context.Context, values ...interface{}) error {
 	buf := make([]byte, 0, len(b.query)-b.qStartLen)
 
-	buf = append(buf, ' ', '(')
-	for _, arg := range a {
+	if len(b.query) != b.qStartLen {
+		buf = append(buf, ',', '(')
+	} else {
+		buf = append(buf, '(')
+	}
+
+	for _, arg := range values {
 		switch v := arg.(type) {
 		case nil:
 			buf = append(buf, "NULL"...)
@@ -88,7 +106,7 @@ func (b *Batch) Add(ctx context.Context, a ...interface{}) error {
 			} else {
 				buf = append(buf, '0')
 			}
-		// case time.Time: TODO
+		// case time.Time: TODO?
 
 		case []byte:
 			if v == nil {
@@ -127,8 +145,8 @@ func (b *Batch) Add(ctx context.Context, a ...interface{}) error {
 	return nil
 }
 
-func (b *Batch) flush(ctx context.Context) error {
-	log.Infof(ctx, "Flush: %s", b.query)
+func (b *BatchInsert) flush(ctx context.Context) error {
+	// log.Infof(ctx, "Flush: %s", b.query)
 	res, err := b.tx.ExecContext(ctx, string(b.query))
 	if err != nil {
 		return err
@@ -150,7 +168,9 @@ func (b *Batch) flush(ctx context.Context) error {
 	return nil
 }
 
-func (b *Batch) Flush(ctx context.Context) ([]int64, error) {
+// Flush sends up any remaining inserts and if requested by the Config, the
+// inserted record ids.
+func (b *BatchInsert) Flush(ctx context.Context) ([]int64, error) {
 	err := b.flush(ctx)
 	if b.ids == nil {
 		return nil, err
